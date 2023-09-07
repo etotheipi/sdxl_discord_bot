@@ -1,0 +1,6 @@
+[submodule "ComfyUI"]
+	path = ComfyUI
+	url = https://github.com/comfyanonymous/ComfyUI.git
+[submodule "StyleSelectorXL"]
+	path = StyleSelectorXL
+	url = https://github.com/ahgsql/StyleSelectorXL
