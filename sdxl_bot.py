@@ -1,20 +1,23 @@
+from datetime import datetime
+from copy import deepcopy
+import argparse
+import asyncio
+import json
+import numpy as np
+import os
+import queue
+import random
+import requests
+import sys
+import threading
+import tiktoken
+import time
+import yaml
+
+from PIL import Image
+from io import BytesIO
 import discord
 from discord.ext import commands, tasks
-import requests
-import asyncio
-from copy import deepcopy
-import json
-import threading
-import yaml
-import time
-import os
-import sys
-import tiktoken
-import datetime
-import queue
-import argparse
-import random
-import sys
 
     
 
@@ -199,7 +202,6 @@ class SdxlBot(discord.Bot):
             if style_name.lower() not in [s['name'].lower() for s in self.styles_list]:
                 err_msg = f'Style "{style_name}" not found. Type "liststyles" to see all options.'
                 await message.channel.send(err_msg)
-                #await self.process_commands(message)
                 await message.add_reaction(u'\u274c')
                 return
 
@@ -215,7 +217,7 @@ class SdxlBot(discord.Bot):
         # User requests help
         bot_help_msg = 'If you want me to generate an SDXL image, tag me and provide the positive prompt ' \
                        'as the body of the message.  If you want to include a negative prompts, simply ' \
-                       'add two newlines (2x shift-enter) to the end, and then add "Negative: <prompt>"'
+                       'add two newlines (shift-enter) to the end, and then add "Negative: <prompt>"'
 
         if user_message.startswith('HELP'):
             await message.channel.send(bot_help_msg)
@@ -239,6 +241,28 @@ class SdxlBot(discord.Bot):
                                          'image generation in process.  Try again later.')
             #await self.process_commands(message)
             return
+        
+        img2img_path = None
+        if len(message.attachments) > 0:
+            attachment = message.attachments[0]
+            if attachment.filename.lower().endswith(('png', 'jpg', 'jpeg')):
+                # Comfy doesn't seem to give me a choice about this.  LoadImage expects it here
+                save_dir = './ComfyUI/input'  
+                os.makedirs(save_dir, exist_ok=True)
+                
+                response = requests.get(attachment.url)
+                attached_img = Image.open(BytesIO(response.content))
+                attached_img = attached_img.convert('RGB')
+                
+                time_string = datetime.now().strftime('%Y_%m_%d_%H%M')
+                orig_fn = f'{time_string}_img2img_orig.jpg'
+                orig_path = os.path.join(save_dir, orig_fn)
+                attached_img.save(orig_path)
+                img2img_path = self.crop_resize_save_image(orig_path)
+                # Comfy's LoadImage expects just the filename, and will look in ComfyUi/input for it
+                img2img_path = os.path.basename(img2img_path)
+                
+                
 
         try:
             sdxl_request_params = {
@@ -257,18 +281,29 @@ class SdxlBot(discord.Bot):
                 'num_steps_refiner': args.refiner_steps,
                 'denoise_refiner': args.refiner_denoise,
             }
-
-            self.curr_sdxl_thread = threading.Thread(target=self.run_sdxl, kwargs=sdxl_kwargs)
-            self.curr_sdxl_thread.start()
+            
+            if img2img_path is None:
+                # Regular, text-only input SDXL
+                self.curr_sdxl_thread = threading.Thread(target=self.run_sdxl, kwargs=sdxl_kwargs)
+                self.curr_sdxl_thread.start()
+            else:
+                # Img2Img SDXL
+                sdxl_request_params['input_image_path'] = img2img_path
+                sdxl_kwargs = {
+                    'req_map': sdxl_request_params,
+                    'num_steps_base': args.base_steps,
+                    'denoise_base_img2img': args.base_denoise_img2img,
+                }
+                self.curr_sdxl_thread = threading.Thread(target=self.run_sdxl_img2img, kwargs=sdxl_kwargs)
+                self.curr_sdxl_thread.start()
+                await message.add_reaction(u"\U0001F5BC") # indicate img2img
 
             await self.change_presence(status=discord.Status.dnd, activity=discord.Game(name="GENERATING..."))
             await message.add_reaction(u"\U0001F44D") # thumbsup
-            #await self.process_commands(message)
 
 
         except asyncio.CancelledError:
             await message.channel.send(f'Sorry {message.author.mention}, your request was canceled')
-            #await self.process_commands(message)
             logger.info('Task was canceled')
             return
         
@@ -328,8 +363,8 @@ class SdxlBot(discord.Bot):
                 clip_refiner_encode_pos = cliptextencode.encode(text=positive_prompt, clip=self.ckpt_refiner[1])
                 clip_refiner_encode_neg = cliptextencode.encode(text=negative_prompt, clip=self.ckpt_refiner[1])
 
-                emptylatentimage = EmptyLatentImage()
-                emptylatentimage_21 = emptylatentimage.generate(width=img_width, height=img_height, batch_size=batch_size)
+                eli = EmptyLatentImage()
+                emptylatentimage = eli.generate(width=img_width, height=img_height, batch_size=batch_size)
 
                 ksampler = KSampler()
                 vaedecode = VAEDecode()
@@ -345,7 +380,7 @@ class SdxlBot(discord.Bot):
                     model=self.ckpt_base[0],
                     positive=clip_base_encode_pos[0],
                     negative=clip_base_encode_neg[0],
-                    latent_image=emptylatentimage_21[0],
+                    latent_image=emptylatentimage[0],
                 )
 
                 if not include_base_output:
@@ -376,6 +411,98 @@ class SdxlBot(discord.Bot):
                 req_map['fn_list_refined'] = [os.path.join(img_output_dir, fn['filename']) for fn in refiner_out['ui']['images']]
                 self.response_queue.put(req_map)
 
+    def run_sdxl_img2img(self,
+                  req_map,
+                  seed_base=None,
+                  num_steps_base=20,
+                  denoise_base_img2img=0.4,
+        ):
+
+        img_input_dir = 'ComfyUI/input'  # ComfyUI doesn't want to let me change this...
+        img_output_dir = 'ComfyUI/output'  # ComfyUI doesn't want to let me change this...
+        os.makedirs(img_output_dir, exist_ok=True)
+
+        with self.sdxl_lock:
+            logging.info('SDXL Thread Started')
+            # This shouldn't be needed, but in case something goes wrong, limit it to 10Hz
+            time.sleep(0.1)
+
+            # This is a dictionary with the keys "requestor", "positive_prompt", "negative_prompt", "message_obj"
+            # We will add "fn_list_base" and "fn_list_refined"
+            requestor = req_map['requestor']
+            positive_prompt = req_map['positive_prompt']
+            negative_prompt = req_map['negative_prompt']
+            input_image_path = req_map['input_image_path']
+
+            logger.info('Request received in run_sdxl()')
+            logger.info(f'Requestor: """{requestor}"""')
+            logger.info(f'Positive prompt: """{positive_prompt}"""')
+            logger.info(f'Negative prompt: """{negative_prompt}"""')
+            logger.info(f'Input Image: """{input_image_path}"""')
+
+            seed_base    = random.getrandbits(64) if seed_base    is None else seed_base
+
+            with torch.inference_mode():
+
+                cliptextencode = CLIPTextEncode()
+                clip_base_encode_pos  = cliptextencode.encode(text=positive_prompt, clip=self.ckpt_base[1])
+                clip_base_encode_neg  = cliptextencode.encode(text=negative_prompt, clip=self.ckpt_base[1])
+
+                loadimage = LoadImage()
+                load_image = loadimage.load_image(image=input_image_path)
+
+                vae_base_encode = VAEEncode()
+                img2img_encoded = vae_base_encode.encode(pixels=load_image[0], vae=self.ckpt_base[2])
+
+                ksampler = KSampler()
+                vaedecode = VAEDecode()
+                saveimage = SaveImage()
+
+                ksampler_base = ksampler.sample(
+                    seed=seed_base,
+                    steps=num_steps_base,
+                    cfg=6,
+                    sampler_name="dpmpp_2s_ancestral",
+                    scheduler="normal",
+                    denoise=denoise_base_img2img,
+                    model=self.ckpt_base[0],
+                    positive=clip_base_encode_pos[0],
+                    negative=clip_base_encode_neg[0],
+                    latent_image=img2img_encoded[0],
+                )
+
+                logger.info('Decoding base image for output')
+                vae_base_decode = vaedecode.decode(samples=ksampler_base[0], vae=self.ckpt_base[2])
+                base_out = saveimage.save_images(filename_prefix="sdxl_img2img_output", images=vae_base_decode[0])
+                print(yaml.dump(base_out, indent=2))
+                req_map['fn_list_base'] = [os.path.join(img_input_dir, input_image_path)]
+                req_map['fn_list_base'].append(os.path.join(img_output_dir, base_out['ui']['images'][0]['filename']))
+                req_map['fn_list_refined'] = []
+                self.response_queue.put(req_map)
+                
+                
+    def crop_resize_save_image(self, orig_image_path):
+        if not os.path.exists(orig_image_path):
+            return None
+        
+        img = np.array(Image.open(orig_image_path))
+        w,h,c = img.shape
+        print('Input image shape:',w,h,c)
+        if w > h:
+            img = img[w//2-h//2:w//2+h//2, :, :]
+        if h > w:
+            img = img[:, h//2-w//2:h//2+w//2, :]
+            
+        print('Output image shape:', img.shape)
+        img = Image.fromarray(np.uint8(img)).convert('RGB')
+        img = img.resize((1024, 1024))
+        
+        time_string = datetime.now().strftime('%Y_%m_%d_%H%M')
+        output_path = orig_image_path[:-9] + '_cropped.jpg'
+        output_path = '_'.join(orig_image_path.split('_')[:-1]) + '_cropped.jpg'
+        img.save(output_path)
+        return output_path
+        
                     
     @tasks.loop(seconds=1)
     async def auto_message_sender_loop(self, out_map=None):
@@ -398,7 +525,6 @@ class SdxlBot(discord.Bot):
         fn_list = out_map['fn_list_base'] + out_map['fn_list_refined']
         await self.change_presence(status=discord.Status.online)
         await message.channel.send(response_text, files=[discord.File(f) for f in fn_list])
-        #await self.process_commands(message)
 
 
 
@@ -425,6 +551,7 @@ if __name__ == '__main__':
     parser.add_argument('--disable-dm', action='store_true', help='Do not allow direct messages to bot.')
     parser.add_argument('--base-steps', type=int, default=25, help='Number of steps to use for the base model')
     parser.add_argument('--base-denoise', type=float, default=1.0, help='Denoise strength of base model')
+    parser.add_argument('--base-denoise-img2img', type=float, default=0.5, help='Denoise strength of base model for img2img (refiner skipped)')
     parser.add_argument('--refiner-steps', type=int, default=10, help='Number of steps to use for the refiner model')
     parser.add_argument('--refiner-denoise', type=float, default=0.25, help='Denoise strength of refiner model')
     parser.add_argument('--debug', action='store_true', help='Include debug logging output')
@@ -446,9 +573,11 @@ if __name__ == '__main__':
         EmptyLatentImage,
         CheckpointLoaderSimple,
         VAEDecode,
+        VAEEncode,
         CLIPTextEncode,
         KSampler,
         SaveImage,
+        LoadImage,
     )
 
     
